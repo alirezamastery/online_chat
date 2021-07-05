@@ -9,8 +9,9 @@ class Chat(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # *** if you want to use this in async context you cant access foreign-key related fields casually! ***
     def __str__(self):
-        return str(self.user)
+        return str(self.pk)
 
 
 class ChatMessage(models.Model):
@@ -21,4 +22,11 @@ class ChatMessage(models.Model):
     from_user = models.BooleanField(default=True)
 
     def __str__(self):
-        return str(self.author)
+        return self.author
+
+
+class SomeData(models.Model):
+    num = models.BigIntegerField(default=0)
+
+    def __str__(self):
+        return str(self.num)

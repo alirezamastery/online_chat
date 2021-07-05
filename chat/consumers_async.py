@@ -1,8 +1,9 @@
 import json
-from channels.generic.websocket import WebsocketConsumer
 from asgiref.sync import async_to_sync
-from rest_framework.renderers import JSONRenderer
 from django.contrib.auth import get_user_model
+from channels.generic.websocket import AsyncWebsocketConsumer
+from channels.db import database_sync_to_async
+from rest_framework.renderers import JSONRenderer
 
 from .models import Chat, ChatMessage, SomeData
 from .serializers import MessageSerializer
@@ -11,59 +12,69 @@ from .serializers import MessageSerializer
 User = get_user_model()
 
 
-class ChatConsumer(WebsocketConsumer):
-    def connect(self):
+class ChatConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
         print(f'in connect | self.channel_name: {self.channel_name} | user: {self.scope["user"]}')
         self.user = self.scope.get('user', None)
-        print('user type:', type(self.scope['user']), self.user.username)
-        print('ppppppppp', type(self.scope['headers']))
-        print('ppppppppp', *self.scope['headers'])
 
         if self.user:
             self.room_name = self.scope['url_route']['kwargs']['room_name']
             self.room_group_name = f'chat_{self.room_name}'
-            self.user_obj = User.objects.filter(username=self.user).first()
-            try:
-                chat_owner = User.objects.filter(username=self.room_name).first()
-                self.chat_obj = Chat.objects.get(user=chat_owner)
-            except:
-                self.chat_obj = Chat.objects.create(user=self.user)
+            # - Use database_sync_to_async like this:
+            # I think the last method in ORM method chain should not be called inside the parentheses
+            # the call should be on whatever database_sync_to_async returns. not () at the end
+            # self.user_obj = await database_sync_to_async(User.objects.filter(username=self.user).first)()
+            # - Or like this:
+            self.user_obj = await self.get_user()
+            print(f'self.user_obj: {self.user_obj}')
+            # try:
+            #     # chat_owner = await database_sync_to_async(User.objects.filter(username=self.room_name).first)()
+            #     # self.chat_obj = await database_sync_to_async(Chat.objects.get)(user=chat_owner)
+            #     # self.chat_obj = await database_sync_to_async(Chat.objects.first)()
+            #     self.chat_obj = await self.get_chat()
+            # except:
+            #     # self.chat_obj = await database_sync_to_async(Chat.objects.create)(user=self.user)
+            #     self.chat_obj = await self.create_chat()
+            #     print('except')
+            self.chat_obj = await self.get_chat()
             print('chat_obj', self.chat_obj)
             print(f'room_name: {self.room_name} | room_group_name:{self.room_group_name}')
             data = SomeData.objects.get(pk=1)
             data.num = data.num + 1
             data.save(update_fields=['num'])
-            async_to_sync(self.channel_layer.group_add)(self.room_group_name, self.channel_name)
-            self.accept()
+            await self.channel_layer.group_add(self.room_group_name, self.channel_name)
+            await self.accept()
 
-    def disconnect(self, code):
-        async_to_sync(self.channel_layer.group_discard)(self.room_group_name, self.channel_name)
+    @database_sync_to_async
+    def get_user(self):
+        return User.objects.filter(username=self.user).first()
 
-    def receive(self, text_data=None, bytes_data=None):
+    @database_sync_to_async
+    def get_chat(self):
+        return Chat.objects.first()
+
+    @database_sync_to_async
+    def create_chat(self):
+        return Chat.objects.create(user=self.user)
+
+
+    async def disconnect(self, code):
+        await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+
+    async def receive(self, text_data=None, bytes_data=None):
         text_data_json = json.loads(text_data)
-        # message = text_data_json['message']
-        # username = text_data_json['username']
         command = text_data_json['command']
         print('text_data_json:', text_data_json)
-        # async_to_sync(self.channel_layer.group_send)(
-        #     self.room_group_name,
-        #     {
-        #         'type':     'chatroom_message',
-        #         'message':  message,
-        #         'username': username
-        #     }
-        # )
         if command == 'new_message':
-            self.new_message(text_data_json)
+            await self.new_message(text_data_json)
         elif command == 'fetch_message':
-            self.fetch_message(text_data_json)
+            await self.fetch_message(text_data_json)
         else:
             print('wrong command')
 
-    def new_message(self, data):
+    async def new_message(self, data):
         message = data['message']
-        # author = data['username']
-        msg_obj = ChatMessage.objects.create(
+        msg_obj = await database_sync_to_async(ChatMessage.objects.create)(
             message=message,
             author=self.user_obj,
             chat=self.chat_obj,
@@ -72,9 +83,9 @@ class ChatConsumer(WebsocketConsumer):
         print('msg_obj:', msg_obj)
         result = self.message_serializer(msg_obj)
         print('result:', result)
-        self.send_to_chat_message(result)
+        await self.send_to_chat_message(result)
 
-    def send_to_chat_message(self, message):
+    async def send_to_chat_message(self, message):
         command = message.get('command', None)
         async_to_sync(self.channel_layer.group_send)(
             self.room_group_name,
@@ -85,13 +96,12 @@ class ChatConsumer(WebsocketConsumer):
             }
         )
 
-    def fetch_message(self, data):
+    async def fetch_message(self, data):
         """
         when client connects it sends a payload with command='fetch_message'
         then this method fetches previous messages for the given username
         """
         print('in fetch_message | data:', data)
-        # username = data['username']
         qs = self.chat_obj.chatmessage_set.all()
         print('in fetch_message | qs:', qs)
         message_json = self.message_serializer(qs)
@@ -100,7 +110,7 @@ class ChatConsumer(WebsocketConsumer):
             'message': message_json,
             'command': 'fetch_message'
         }
-        self.chat_message(content)
+        await self.chat_message(content)
 
     @staticmethod
     def message_serializer(qs):
@@ -114,9 +124,5 @@ class ChatConsumer(WebsocketConsumer):
         return serialized.data
         # return content
 
-    # this method sends message to websocket
-    def chat_message(self, event):
-        # message = event['message']
-        # username = event['username']
-        print('event:', event)
-        self.send(text_data=json.dumps(event))
+    async def chat_message(self, event):
+        await self.send(text_data=json.dumps(event))
