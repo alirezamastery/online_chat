@@ -11,6 +11,70 @@ from .serializers import MessageSerializer
 User = get_user_model()
 
 
+class CommandHandler:
+    def __init__(self, user_obj, chat_obj, room_name):
+        self.user_obj = user_obj
+        self.chat_obj = chat_obj
+        self.room_name = room_name
+        self.code_map = {
+            'new_message':   self.new_message,
+            'fetch_message': self.fetch_message,
+        }
+
+    async def new_message(self, data):
+        message = data['message']
+        msg_obj = await database_sync_to_async(ChatMessage.objects.create)(
+            message=message,
+            author=self.user_obj,
+            chat=self.chat_obj,
+            from_user=True if self.user_obj.username == self.room_name else False
+        )
+        print('msg_obj:', msg_obj)
+        result = await self.message_serializer(msg_obj)
+        print('result:', result)
+        return {
+            'type':    'chat_message',
+            'message': result,
+            'command': 'new_message',
+        }
+
+    async def fetch_message(self, data):
+        """
+        when client connects it sends a payload with command='fetch_message'
+        then this method fetches previous messages for the given username
+        """
+        print('in fetch_message | data:', data)
+        # *** .all() is not executed immediately but only when it is consumed. so you should make it execute
+        # inside database_sync_to_async !!!
+        # qs = await database_sync_to_async(self.chat_obj.chatmessage_set.all)
+        qs = await self.get_chat_messages()
+        print(f'in fetch: qs type: {type(qs)} | {qs.__class__.__name__}')
+        print('in fetch_message | qs:', qs)
+        message_json = await self.message_serializer(qs)
+        print('in fetch_message | message_json:', message_json)
+        return {
+            'type':    'chat_message',
+            'message': message_json,
+            'command': 'fetch_message'
+        }
+
+    @database_sync_to_async
+    def get_chat_messages(self):
+        return list(self.chat_obj.chatmessage_set.all().select_related('author', 'chat__user'))
+
+    @staticmethod
+    async def message_serializer(qs):
+        serialized = MessageSerializer(
+            qs,
+            many=True if (type(qs) == list) else False  # or: many=True if (qs.__class__.__name__ == 'list') else False
+        )
+        print('serialized.data:', serialized.data)
+        content = JSONRenderer().render(serialized.data)
+        print('JSONRenderered:', content)
+        return serialized.data
+        # return content
+
+
 class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         print(f'in connect | self.channel_name: {self.channel_name} | user: {self.scope["user"]}')
@@ -34,6 +98,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 print('in except')
             print('chat_obj', self.chat_obj)
             print(f'room_name: {self.room_name} | room_group_name:{self.room_group_name}')
+            self.command_handler = CommandHandler(self.user, self.chat_obj, self.room_name)
             # somedata_objects = await database_sync_to_async(SomeData.objects.filter(id__gt=0).order_by)('id')
             somedata_objects = await self.get_somedata()
             print(f'some data objects: {somedata_objects}')
@@ -66,74 +131,18 @@ class ChatConsumer(AsyncWebsocketConsumer):
         text_data_json = json.loads(text_data)
         command = text_data_json['command']
         print('text_data_json:', text_data_json)
-        if command == 'new_message':
-            await self.new_message(text_data_json)
-        elif command == 'fetch_message':
-            await self.fetch_message(text_data_json)
+        if command in self.command_handler.code_map:
+            response = await self.command_handler.code_map[command](text_data_json)
         else:
-            print('wrong command')
-
-    async def new_message(self, data):
-        message = data['message']
-        msg_obj = await database_sync_to_async(ChatMessage.objects.create)(
-            message=message,
-            author=self.user_obj,
-            chat=self.chat_obj,
-            from_user=True if self.user.username == self.room_name else False
-        )
-        print('msg_obj:', msg_obj)
-        result = await self.message_serializer(msg_obj)
-        print('result:', result)
-        await self.send_to_chat_message(result)
+            raise Exception('invalid command')
+        await self.send_to_chat_message(response)
 
     async def send_to_chat_message(self, message):
-        command = message.get('command', None)
+        print(type(message))
         await self.channel_layer.group_send(
             self.room_group_name,
-            {
-                'type':    'chat_message',
-                'message': message,
-                'command': 'img' if (command == 'img') else 'new_message',
-            }
+            message
         )
-
-    async def fetch_message(self, data):
-        """
-        when client connects it sends a payload with command='fetch_message'
-        then this method fetches previous messages for the given username
-        """
-        print('in fetch_message | data:', data)
-        # *** .all() is not executed immediately but only when it is consumed. so you should make it execute
-        # inside database_sync_to_async !!!
-        # qs = await database_sync_to_async(self.chat_obj.chatmessage_set.all)
-        qs = await self.get_chat_messages()
-        print(f'in fetch: qs type: {type(qs)} | {qs.__class__.__name__}')
-        # for q in qs:
-        #     print(q)
-        print('in fetch_message | qs:', qs)
-        message_json = await self.message_serializer(qs)
-        print('in fetch_message | message_json:', message_json)
-        content = {
-            'message': message_json,
-            'command': 'fetch_message'
-        }
-        await self.chat_message(content)
-
-    @database_sync_to_async
-    def get_chat_messages(self):
-        return list(self.chat_obj.chatmessage_set.all().select_related('author', 'chat__user'))
-
-    @staticmethod
-    async def message_serializer(qs):
-        serialized = MessageSerializer(
-            qs,
-            many=True if (type(qs) == list) else False  # or: many=True if (qs.__class__.__name__ == 'list') else False
-        )
-        print('serialized.data:', serialized.data)
-        content = JSONRenderer().render(serialized.data)
-        print('JSONRenderered:', content)
-        return serialized.data
-        # return content
 
     async def chat_message(self, event):
         await self.send(text_data=json.dumps(event))

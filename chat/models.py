@@ -22,7 +22,7 @@ class ChatMessage(models.Model):
     from_user = models.BooleanField(default=True)
 
     def __str__(self):
-        return self.author
+        return str(self.pk)
 
 
 class SomeData(models.Model):
